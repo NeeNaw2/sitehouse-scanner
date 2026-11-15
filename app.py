@@ -82,7 +82,7 @@ if r:
     g_col, h_col = st.columns([1, 2])
     with g_col:
         delta = f"{r.score - prev:+d} vs last scan" if prev is not None else None
-        st.metric("Security Grade", r.grade, delta)
+        st.metric("Security Grade", r.grade, delta, delta_color="off" if prev == r.score else "normal")
         st.caption(f"{r.score} / 100 points")
         if r.days_left >= 0:
             st.caption(f"🔒 Lock valid for **{r.days_left} days**")
