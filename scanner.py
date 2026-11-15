@@ -63,8 +63,21 @@ def is_public_host(host: str) -> bool:
         return False
 
 
-def safe_get(url: str, ua: str = TOOL_UA, timeout: int = 8, max_hops: int = 5):
-    """GET that follows redirects manually, validating every hop against the SSRF guard."""
+def make_headers(ua: str) -> dict:
+    h = {"User-Agent": ua}
+    if ua == BROWSER_UA:  # look like a real browser
+        h.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+    return h
+
+
+def safe_get(url: str, ua: str = TOOL_UA, timeout: int = 8, max_hops: int = 10):
+    """GET that follows redirects manually, validating every hop against the SSRF guard.
+    Keeps cookies between hops (many sites redirect until a cookie is set)."""
+    session = requests.Session()
+    chain = []
     for _ in range(max_hops + 1):
         try:
             p = urlparse(url)
@@ -75,9 +88,10 @@ def safe_get(url: str, ua: str = TOOL_UA, timeout: int = 8, max_hops: int = 5):
             raise ScanError("Please enter a normal website address (http/https on standard ports).")
         if not is_public_host(p.hostname):
             raise ScanError("That address isn't a publicly reachable website, so it can't be scanned.")
+        chain.append(url)
         try:
-            r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout,
-                             allow_redirects=False, stream=True)
+            r = session.get(url, headers=make_headers(ua), timeout=timeout,
+                            allow_redirects=False, stream=True)
         except requests.RequestException as e:
             raise ScanError(f"Could not reach site: {e}")
         if r.is_redirect and r.headers.get("location"):
@@ -85,7 +99,8 @@ def safe_get(url: str, ua: str = TOOL_UA, timeout: int = 8, max_hops: int = 5):
             r.close()
             continue
         return r
-    raise ScanError("Too many redirects.")
+    tail = " → ".join(c[:70] for c in chain[-4:])
+    raise ScanError(f"Too many redirects. Last hops: {tail}")
 
 
 # ---------- pure evaluators (easy to unit test) ----------
@@ -257,8 +272,14 @@ def scan(raw_url: str, on_progress=None) -> ScanResult:
         raise ScanError("Please type a website address.")
     url = raw if raw.lower().startswith(("http://", "https://")) else f"https://{raw}"
 
-    res = safe_get(url, TOOL_UA)
     notes = []
+    try:
+        res = safe_get(url, TOOL_UA)
+    except ScanError as e:
+        if "redirect" not in str(e).lower():
+            raise
+        res = safe_get(url, BROWSER_UA)  # retry like a normal browser
+        notes.append("The site redirected our scanner in a loop, so we retried like a normal browser.")
     if res.status_code in BLOCKED_CODES:
         res.close()
         res = safe_get(url, BROWSER_UA)
