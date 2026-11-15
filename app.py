@@ -1,208 +1,135 @@
-import socket
-import ssl
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-import requests
+import time
+
 import streamlit as st
+import streamlit.components.v1 as components
+
+from checks import CHECKS, CHECK_BY_ID, MODES, PLATFORMS, describe, fix_for
+from reports import build_badge_svg, build_html_report, build_text_report
+from scanner import ScanError, scan
+
+MIN_SECONDS_BETWEEN_SCANS = 10
+ICON = {"pass": "🟢", "warn": "🟡", "fail": "🔴"}
+COLOR = {"pass": "#2e9e5b", "warn": "#e0a100", "fail": "#d64545"}
 
 st.set_page_config(page_title="SiteHouse Security Checkup", page_icon="🏠")
 
-# --- 1. RULEBOOK & EXPLANATIONS ---
-CHECKS = [
-{
-"id": "https", "pts": 20, "part": "Front Door Lock",
-"house": ("🔒 Locked Gold Padlock", "🚪 Unlocked Door"),
-"Kid": ("Front Door Lock (HTTPS)", "Visitors use a secret code so spies cannot listen in!", "Uh oh! Your front door is unlocked on public Wi-Fi."),
-"Business": ("Encrypted Connection", "Customer forms are encrypted, boosting trust and SEO.", "Browsers warn visitors your site is 'Not Secure'."),
-"Developer": ("HTTPS Enforcement", "Site resolved securely over HTTPS.", "Site served over plain HTTP without TLS redirect."),
-"fixes": {
-"WordPress": "Install 'Really Simple SSL' or enable SSL in your hosting panel.",
-"Shopify / Wix": "Go to Settings -> Domains and toggle SSL ON.",
-"Vercel / Netlify": "Verify custom domain DNS; HTTPS is automatic.",
-"Nginx / Custom": "Run Certbot (Let's Encrypt) and redirect port 80 to 443."
-}
-},
-{
-"id": "ssl_valid", "pts": 15, "part": "Lock Warranty",
-"house": ("📅 Valid Lock Warranty", "⚠️ Expiring/Broken Lock"),
-"Kid": ("Lock Warranty (SSL Expiry)", "Your front door lock is fresh and up to date!", "Your lock warranty is expired or running out very soon!"),
-"Business": ("SSL Certificate Health", "Your security certificate is active with plenty of days left.", "An expired SSL certificate will block customers with a scary browser warning."),
-"Developer": ("TLS Certificate Validity", "Certificate is valid with >14 days remaining.", "Certificate is expired, unreachable, or expires in <14 days."),
-"fixes": {
-"WordPress": "Check auto-renewal in cPanel/hosting dashboard or Cloudflare SSL.",
-"Shopify / Wix": "Contact platform support if auto-renewing SSL is stuck.",
-"Vercel / Netlify": "Check domain settings and renew/re-verify DNS records.",
-"Nginx / Custom": "Run `sudo certbot renew` and ensure a cron job/systemd timer is active."
-}
-},
-{
-"id": "hsts", "pts": 15, "part": "Automatic Deadbolt",
-"house": ("🛡️ Auto-Lock Active", "🔓 Manual Lock Only"),
-"Kid": ("Automatic Deadbolt (HSTS)", "Your door automatically locks behind every visitor!", "Visitors have to remember to lock the door themselves."),
-"Business": ("Strict Connection Security", "Blocks Wi-Fi interception attacks automatically.", "Attackers on public Wi-Fi could downgrade visitor connections."),
-"Developer": ("HSTS Header", "Strict-Transport-Security header is active.", "Missing 'Strict-Transport-Security' response header."),
-"fixes": {
-"WordPress": "Activate the 'Headers Security Advanced & HSTS WP' plugin.",
-"Shopify / Wix": "Handled automatically when primary domain redirect is active.",
-"Vercel / Netlify": "Add `Strict-Transport-Security: max-age=31536000` in config.",
-"Nginx / Custom": "Add `add_header Strict-Transport-Security \"max-age=31536000\";`."
-}
-},
-{
-"id": "frame", "pts": 15, "part": "Window Blinds",
-"house": ("🪟 Blinds Closed", "👀 Open Windows"),
-"Kid": ("Window Blinds (Anti-Clickjacking)", "Copycat sites cannot put your house inside a fake window!", "Windows are open! Sneaky sites could trap your page in a frame."),
-"Business": ("Brand Impersonation Guard", "Stops scammers from embedding your site to steal clicks.", "Scammers could overlay invisible buttons over your pages."),
-"Developer": ("Frame Protection", "X-Frame-Options or CSP frame-ancestors is set.", "Missing 'X-Frame-Options' or CSP 'frame-ancestors'."),
-"fixes": {
-"WordPress": "Add `Header always set X-Frame-Options \"SAMEORIGIN\"` to `.htaccess`.",
-"Shopify / Wix": "Protected on checkout by default; audit custom app embeds.",
-"Vercel / Netlify": "Add `X-Frame-Options: SAMEORIGIN` to your headers file.",
-"Nginx / Custom": "Add `add_header X-Frame-Options \"SAMEORIGIN\";` in Nginx."
-}
-},
-{
-"id": "csp", "pts": 20, "part": "Guest List",
-"house": ("📋 Guest List Active", "🎉 Anyone Can Walk In"),
-"Kid": ("Party Guest List (CSP)", "Only approved scripts are allowed inside your website.", "No guest list! Outside scripts might sneak into your pages."),
-"Business": ("Malicious Script Blocker", "Blocks unauthorized code from stealing form data.", "Higher risk of script injection if a plugin has a bug."),
-"Developer": ("Content-Security-Policy", "CSP header is configured.", "Missing 'Content-Security-Policy' header."),
-"fixes": {
-"WordPress": "Use the 'HTTP Headers' plugin to set `default-src 'self'`.",
-"Shopify / Wix": "Remove unused third-party apps; add CSP via Cloudflare.",
-"Vercel / Netlify": "Define `Content-Security-Policy` in `vercel.json` or `_headers`.",
-"Nginx / Custom": "Add `add_header Content-Security-Policy \"default-src 'self';\";`."
-}
-},
-{
-"id": "env", "pts": 15, "part": "Welcome Mat",
-"house": ("🧹 Clean Mat (No Keys)", "🔑 Keys Under Mat!"),
-"Kid": ("Keys Under the Mat (.env)", "No secret house keys left hiding under the welcome mat!", "DANGER! Your secret password file (.env) is sitting out in the open!"),
-"Business": ("Secret File Protection", "Database passwords and API keys are safely hidden.", "CRITICAL: Server passwords are publicly readable right now."),
-"Developer": ("Exposed /.env Check", "GET /.env did not expose environment secrets.", "GET /.env returned HTTP 200 with secret key patterns!"),
-"fixes": {
-"WordPress": "Add `RedirectMatch 403 /\\..*$` to your `.htaccess` file.",
-"Shopify / Wix": "Managed by platform; never put API secrets in theme JS files.",
-"Vercel / Netlify": "Keep `.env` out of Git; use dashboard Environment Variables.",
-"Nginx / Custom": "Add `location ~ /\\. { deny all; }` to block hidden files."
-}
-}
-]
 
-# --- 2. SCANNER ENGINE ---
-def check_ssl_days(hostname: str) -> int:
-try:
-ctx = ssl.create_default_context()
-with socket.create_connection((hostname, 443), timeout=5) as sock:
-with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
-cert = ssock.getpeercert()
-exp_str = cert["notAfter"]
-exp_date = datetime.strptime(exp_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
-return (exp_date - datetime.now(timezone.utc)).days
-except Exception:
-return -1
+def house_svg(r) -> str:
+    c = lambda cid: COLOR[r.results[cid].status]
+    return f"""<svg viewBox="0 0 300 260" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-height:260px">
+<rect x="205" y="38" width="22" height="50" fill="{c('hsts')}" stroke="#888"/>
+<polygon points="35,112 150,25 265,112" fill="{c('csp')}" stroke="#888" stroke-width="2"/>
+<rect x="60" y="112" width="180" height="108" fill="#e8e2d4" stroke="#888" stroke-width="2"/>
+<rect x="128" y="150" width="44" height="70" rx="3" fill="{c('https')}" stroke="#555"/>
+<circle cx="162" cy="188" r="3" fill="#fff"/>
+<rect x="75" y="135" width="38" height="38" fill="{c('frame')}" stroke="#555"/>
+<rect x="187" y="135" width="38" height="38" fill="{c('frame')}" stroke="#555"/>
+<rect x="45" y="220" width="210" height="12" fill="{c('ssl_valid')}" stroke="#888"/>
+<rect x="115" y="236" width="70" height="12" rx="2" fill="{c('files')}" stroke="#888"/>
+</svg>"""
 
-def scan_site(raw_url: str):
-url = raw_url.strip() if raw_url.startswith(("http://", "https://")) else f"https://{raw_url.strip()}"
-req_headers = {"User-Agent": "SiteHouseSecurityCheckup/1.0 (Educational Scanner)"}
-try:
-res = requests.get(url, headers=req_headers, timeout=8)
-except requests.RequestException as e:
-return None, 0, f"Could not reach site: {e}", -1
 
-hdrs = {k.lower(): v for k, v in res.headers.items()}
-parsed = urlparse(res.url)
-base = f"{parsed.scheme}://{parsed.netloc}"
-days_left = check_ssl_days(parsed.hostname) if parsed.hostname else -1
-
-env_safe = True
-try:
-env = requests.get(f"{base}/.env", headers=req_headers, timeout=4, allow_redirects=False)
-if env.status_code == 200 and any(w in env.text for w in ("DB_", "SECRET", "KEY")):
-env_safe = False
-except requests.RequestException:
-pass
-
-passed_map = {
-"https": res.url.startswith("https://"),
-"ssl_valid": days_left > 14,
-"hsts": "strict-transport-security" in hdrs,
-"frame": "x-frame-options" in hdrs or "frame-ancestors" in hdrs.get("content-security-policy", ""),
-"csp": "content-security-policy" in hdrs,
-"env": env_safe,
-}
-
-score = sum(c["pts"] for c in CHECKS if passed_map[c["id"]])
-return passed_map, score, res.url, days_left
-
-def build_report_text(url: str, grade: str, score: int, days_left: int, passed_map: dict, mode: str, platform: str) -> str:
-lines = [
-"# SiteHouse Security Checkup Report",
-f"Website: {url}",
-f"Grade: {grade} ({score}/100) | SSL Days Remaining: {days_left if days_left >= 0 else 'N/A'}",
-f"View Mode: {mode} | Platform: {platform}",
-"-" * 50,
-]
-for c in CHECKS:
-ok = passed_map[c["id"]]
-title, pass_msg, fail_msg = c[mode]
-status = "[PASS]" if ok else "[FIX NEEDED]"
-lines.append(f"\n{status} {title} (+{c['pts']} pts)")
-lines.append(f" {pass_msg if ok else fail_msg}")
-if not ok:
-lines.append(f" How to fix ({platform}): {c['fixes'][platform]}")
-return "\n".join(lines)
-
-# --- 3. USER INTERFACE ---
+# --- UI ---
 st.title("🏠 SiteHouse Security Checkup")
-st.caption("Check any website's safety in 3 seconds—explained so anyone can understand.")
+st.caption("Check any website's safety in seconds—explained so anyone can understand. "
+           "Only scan sites you own or have permission to test.")
 
-url_input = st.text_input("Website Address", placeholder="Type a website (e.g., example.com)")
+with st.form("scan_form"):
+    url_input = st.text_input("Website Address", placeholder="Type a website (e.g., example.com)")
+    submitted = st.form_submit_button("🔍 Scan")
 
-if url_input:
-with st.spinner("Knocking on the front door and checking the lock warranty..."):
-passed_map, score, info, days_left = scan_site(url_input)
+if submitted and url_input.strip():
+    wait = MIN_SECONDS_BETWEEN_SCANS - (time.time() - st.session_state.get("last_scan", 0))
+    if wait > 0:
+        st.warning(f"Please wait {int(wait) + 1}s before scanning again.")
+    else:
+        st.session_state["last_scan"] = time.time()
+        bar = st.progress(0.0, text="Knocking on the front door...")
 
-if not passed_map:
-st.error(info)
-else:
-if score == 100:
-st.balloons()
+        def on_progress(done, total, part):
+            bar.progress(done / total, text=f"Checked: {part}")
 
-# Controls
-c1, c2 = st.columns(2)
-mode = c1.radio("Who is reading?", ["Kid", "Business", "Developer"], horizontal=True)
-platform = c2.selectbox("Platform", ["WordPress", "Shopify / Wix", "Vercel / Netlify", "Nginx / Custom"])
+        try:
+            result = scan(url_input, on_progress)
+            history = st.session_state.setdefault("history", [])
+            prev = next((h for h in reversed(history) if h["host"] == result.host), None)
+            st.session_state["prev_score"] = prev["score"] if prev else None
+            history.append({"time": result.scanned_at, "host": result.host,
+                            "grade": result.grade, "score": result.score})
+            st.session_state["result"], st.session_state["error"] = result, None
+            st.session_state["celebrate"] = result.score == 100
+        except ScanError as e:
+            st.session_state["result"], st.session_state["error"] = None, str(e)
+        finally:
+            bar.empty()
 
-# Grade & House Visual
-grade = next(g for min_s, g in [(95, "A+"), (80, "A"), (60, "B"), (40, "C"), (0, "F")] if score >= min_s)
-g_col, h_col = st.columns([1, 2])
+if st.session_state.get("error"):
+    st.error(st.session_state["error"])
 
-with g_col:
-st.metric("Security Grade", grade, f"{score} / 100 pts")
-if days_left >= 0:
-st.caption(f"🔒 Lock valid for **{days_left} days**")
+r = st.session_state.get("result")
+if r:
+    if st.session_state.pop("celebrate", False):
+        st.balloons()
 
-with h_col:
-house_lines = [f"**{c['part']}:** {c['house'][0 if passed_map[c['id']] else 1]}" for c in CHECKS]
-st.info("🏡 **Visual House X-Ray**\n\n" + "\n\n".join(house_lines))
+    for note in r.notes:
+        st.info(note)
 
-# Download Report Button
-report_txt = build_report_text(info, grade, score, days_left, passed_map, mode, platform)
-st.download_button(
-label="📥 Download Checkup Report",
-data=report_txt,
-file_name=f"sitehouse-report-{urlparse(info).netloc}.txt",
-mime="text/plain"
-)
+    c1, c2 = st.columns(2)
+    mode = c1.radio("Who is reading?", MODES, horizontal=True)
+    platform = c2.selectbox("Platform", PLATFORMS)
 
-# Detailed Cards
-for c in CHECKS:
-ok = passed_map[c["id"]]
-title, pass_msg, fail_msg = c[mode]
-with st.container(border=True):
-st.markdown(f"#### {'🟢' if ok else '🔴'} {title} *(+{c['pts']} pts)*")
-st.write(pass_msg if ok else fail_msg)
-if not ok:
-with st.expander(f"🛠️ Fix for {platform}"):
-st.info(c["fixes"][platform])
+    prev = st.session_state.get("prev_score")
+    g_col, h_col = st.columns([1, 2])
+    with g_col:
+        delta = f"{r.score - prev:+d} vs last scan" if prev is not None else None
+        st.metric("Security Grade", r.grade, delta)
+        st.caption(f"{r.score} / 100 points")
+        if r.days_left >= 0:
+            st.caption(f"🔒 Lock valid for **{r.days_left} days**")
+    with h_col:
+        components.html(house_svg(r), height=260)
+
+    with st.expander("🏡 House X-Ray details"):
+        for c in CHECKS:
+            res = r.results[c["id"]]
+            label = c["house"][0] if res.status == "pass" else (
+                "Partly secured" if res.status == "warn" else c["house"][1])
+            st.markdown(f"{ICON[res.status]} **{c['part']}:** {label}")
+
+    # Top fixes
+    todo = sorted((x for x in r.results.values() if x.status != "pass"),
+                  key=lambda x: CHECK_BY_ID[x.id]["pts"] - x.points, reverse=True)[:3]
+    if todo:
+        st.subheader("🎯 Fix these first")
+        for x in todo:
+            c = CHECK_BY_ID[x.id]
+            title, _ = describe(c, x.status, x.detail, mode)
+            st.markdown(f"- **{title}** — up to **+{c['pts'] - x.points:g} pts**")
+
+    # Downloads
+    d1, d2, d3 = st.columns(3)
+    host = r.host
+    d1.download_button("📥 Text report", build_text_report(r, mode, platform),
+                       file_name=f"sitehouse-report-{host}.txt", mime="text/plain")
+    d2.download_button("🌐 HTML report", build_html_report(r, mode, platform),
+                       file_name=f"sitehouse-report-{host}.html", mime="text/html")
+    d3.download_button("🏅 SVG badge", build_badge_svg(r),
+                       file_name=f"sitehouse-badge-{host}.svg", mime="image/svg+xml")
+
+    # Detailed cards
+    for c in CHECKS:
+        res = r.results[c["id"]]
+        title, msg = describe(c, res.status, res.detail, mode)
+        with st.container(border=True):
+            st.markdown(f"#### {ICON[res.status]} {title} *({res.points:g}/{c['pts']} pts)*")
+            st.write(msg)
+            if res.status != "pass":
+                with st.expander(f"🛠️ Fix for {platform}"):
+                    text, code = fix_for(c, platform)
+                    st.info(text)
+                    if code:
+                        st.code(code)
+
+if st.session_state.get("history"):
+    with st.expander("📈 Scan history (this session)"):
+        st.dataframe(st.session_state["history"][::-1], use_container_width=True, hide_index=True)
