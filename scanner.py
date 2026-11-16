@@ -97,7 +97,7 @@ def safe_get(url: str, ua: str = TOOL_UA, timeout: int = 8, max_hops: int = 10):
         try:
             r = session.get(url, headers=make_headers(ua), timeout=timeout,
                             allow_redirects=False, stream=True)
-                except requests.exceptions.ConnectTimeout:
+        except requests.exceptions.ConnectTimeout:
             raise ScanError("The site didn't answer in time. It may be down, or it may block "
                             "scanners running from overseas cloud servers. Try again, or run "
                             "the app on your own computer.")
