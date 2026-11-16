@@ -181,3 +181,48 @@ def fix_for(check: dict, platform: str):
     """Returns (text, code_or_None) for the chosen platform."""
     fix = check["fixes"][platform]
     return fix if isinstance(fix, tuple) else (fix, None)
+
+
+# ---------------- Deep checks (separate 100-point score, optional) ----------------
+DEEP_CHECKS = [
+    {
+        "id": "software", "pts": 40, "part": "Building Materials",
+        "house": ("🧱 Materials Up To Date", "🪵 Old Materials Detected"),
+        "Kid": ("Building Materials (Software Updates)", "Everything your website is built from is the newest version!", "Some parts of your website are old and may have known weak spots!"),
+        "Business": ("Software Up To Date", "Your website platform and plugins are on current versions.", "Outdated website software is one of the most common ways sites get hacked."),
+        "Developer": ("CMS / Plugin / Theme Versions", "Detected CMS, plugins and themes match the latest release (or aren't exposed).", "Detected CMS core, plugins or themes are behind the latest release."),
+        "fixes": {
+            "WordPress": "Back up first, then Dashboard → Updates: update core, plugins and themes. Delete plugins and themes you don't use.",
+            "Shopify / Wix": "The platform updates itself; update or remove third-party apps and themes.",
+            "Vercel / Netlify": ("Update your dependencies:", "npm outdated\nnpm update"),
+            "Nginx / Custom": ("Update the OS packages and your CMS:", "sudo apt update && sudo apt upgrade"),
+        },
+    },
+    {
+        "id": "js_libs", "pts": 30, "part": "Door Hinges",
+        "house": ("🔩 Hinges Are Solid", "🔩 Rusty Hinges"),
+        "Kid": ("Door Hinges (JavaScript Libraries)", "All the little helper tools on your pages are up to date!", "Some helper tools on your pages are old and have known weak spots!"),
+        "Business": ("Third-Party Script Libraries", "The code libraries your pages load are current.", "Old libraries have publicly known security problems that attackers look for."),
+        "Developer": ("Vulnerable JS Libraries", "No known-vulnerable or end-of-life JS library versions detected.", "Detected JS libraries are below fixed versions or end-of-life."),
+        "fixes": {
+            "WordPress": "Update the theme/plugins that load the library, and avoid hand-pinned old copies.",
+            "Shopify / Wix": "Update the theme or app that loads the old script.",
+            "Vercel / Netlify": ("Upgrade the flagged package:", "npm install jquery@latest   # or the flagged library\nnpm audit fix"),
+            "Nginx / Custom": ("Point your pages at a current version:", '<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>'),
+        },
+    },
+    {
+        "id": "paths", "pts": 30, "part": "Side Doors",
+        "house": ("🚪 Side Doors Locked", "🚪 Side Doors Ajar"),
+        "Kid": ("Side Doors (Exposed Pages & Folders)", "No forgotten side doors or open folders!", "Some forgotten pages or folders are open to anyone!"),
+        "Business": ("Exposed Admin & Debug Pages", "No debug pages, open folders or admin tools are publicly reachable.", "Debug pages, open folders or admin tools reveal information attackers can use."),
+        "Developer": ("Exposed Paths", "phpinfo, server-status, dumps, .git, directory listing, admin panels and user enumeration not exposed.", "Sensitive paths are reachable."),
+        "fixes": {
+            "WordPress": ("Disable directory listing and block XML-RPC in `.htaccess`:", "Options -Indexes\n<Files xmlrpc.php>\n  Require all denied\n</Files>"),
+            "Shopify / Wix": "Managed by the platform; nothing to change.",
+            "Vercel / Netlify": "Remove the files from the publish directory (`public/` or your build output).",
+            "Nginx / Custom": ("Turn off listings and block the paths:", "autoindex off;\nlocation ~* ^/(phpinfo\\.php|server-status|phpmyadmin) { deny all; }"),
+        },
+    },
+]
+DEEP_BY_ID = {c["id"]: c for c in DEEP_CHECKS}

@@ -15,7 +15,8 @@ try:
 except ImportError:  # email check degrades gracefully
     dns_resolver = None
 
-from checks import CHECKS, CHECK_BY_ID, FACTOR
+from checks import CHECKS, CHECK_BY_ID, DEEP_BY_ID, DEEP_CHECKS, FACTOR
+from deep import check_js_libs, check_paths, check_software
 
 TOOL_UA = "SiteHouseSecurityCheckup/2.0 (Educational Scanner)"
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -47,6 +48,10 @@ class ScanResult:
     days_left: int = -1
     notes: list = field(default_factory=list)
     scanned_at: str = ""
+    deep_results: dict = field(default_factory=dict)
+    deep_score: int = 0
+    deep_grade: str = "F"
+    detected: dict = field(default_factory=dict)
 
 
 def grade_for(score: int) -> str:
@@ -265,7 +270,7 @@ def check_email(host: str):
 
 
 # ---------- main entry ----------
-def scan(raw_url: str, on_progress=None) -> ScanResult:
+def scan(raw_url: str, on_progress=None, deep: bool = False) -> ScanResult:
     """Scan a site. on_progress(done, total, part_name) is always called from the calling thread."""
     raw = raw_url.strip()
     if not raw:
@@ -290,6 +295,17 @@ def scan(raw_url: str, on_progress=None) -> ScanResult:
             notes.append("The site blocked our scanner's user-agent, so we retried like a normal browser.")
     elif res.status_code >= 400:
         notes.append(f"The site answered HTTP {res.status_code} at this address; headers were still checked.")
+    body = ""
+    if deep:  # read (a capped amount of) the page so deep checks can inspect it
+        try:
+            raw = b""
+            for chunk in res.iter_content(65536):
+                raw += chunk
+                if len(raw) >= 500_000:
+                    break
+            body = raw.decode(res.encoding or "utf-8", "ignore")
+        except Exception:
+            body = ""
     res.close()
 
     parsed = urlparse(res.url)
@@ -303,12 +319,12 @@ def scan(raw_url: str, on_progress=None) -> ScanResult:
         cookies = [res.headers["set-cookie"]] if "set-cookie" in res.headers else []
 
     out = ScanResult(url=res.url, host=host, notes=notes, scanned_at=datetime.now().strftime("%H:%M:%S"))
-    total = len(CHECKS)
+    total = len(CHECKS) + (len(DEEP_CHECKS) if deep else 0)
 
     def add(cid, status, detail=""):
         out.results[cid] = CheckResult(cid, status, detail, CHECK_BY_ID[cid]["pts"] * FACTOR[status])
         if on_progress:
-            on_progress(len(out.results), total, CHECK_BY_ID[cid]["part"])
+            on_progress(len(out.results) + len(out.deep_results), total, CHECK_BY_ID[cid]["part"])
 
     # Instant, header-based checks
     add("https", *(("pass", "") if is_https else ("fail", "Final URL is plain HTTP.")))
@@ -342,6 +358,24 @@ def scan(raw_url: str, on_progress=None) -> ScanResult:
                 add(cid, r[0], r[1])
             else:
                 add(cid, r[0], r[1])
+
+    if deep:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            dfut = {pool.submit(check_software, body, h): "software",
+                    pool.submit(check_js_libs, body): "js_libs",
+                    pool.submit(check_paths, base): "paths"}
+            for fut in as_completed(dfut):
+                cid = dfut[fut]
+                try:
+                    status, detail, found = fut.result()
+                except Exception:
+                    status, detail, found = "warn", "this check could not run.", {}
+                out.deep_results[cid] = CheckResult(cid, status, detail, DEEP_BY_ID[cid]["pts"] * FACTOR[status])
+                out.detected.update(found)
+                if on_progress:
+                    on_progress(len(out.results) + len(out.deep_results), total, DEEP_BY_ID[cid]["part"])
+        out.deep_score = round(sum(r.points for r in out.deep_results.values()))
+        out.deep_grade = grade_for(out.deep_score)
 
     out.score = round(sum(r.points for r in out.results.values()))
     out.grade = grade_for(out.score)
